@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Upload</title>
+  <link rel="stylesheet" href="/app.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <main class="page">
+    <header>
+      <h1 id="title"></h1>
+      <p id="subtitle" class="muted"></p>
+    </header>
+
+    <section id="drop" class="drop" aria-labelledby="drop-title">
+      <p id="drop-title" class="drop-title"></p>
+      <p id="drop-hint" class="muted"></p>
+      <div class="actions">
+        <button type="button" id="pick-files" disabled></button>
+        <button type="button" id="pick-folder" class="secondary" disabled></button>
+      </div>
+      <input type="file" id="file-input" multiple hidden>
+      <input type="file" id="folder-input" webkitdirectory multiple hidden>
+    </section>
+
+    <section class="status">
+      <p id="summary" aria-live="polite"></p>
+      <button type="button" id="retry" class="secondary" hidden></button>
+      <p id="notice" class="notice" role="status" hidden></p>
+    </section>
+
+    <ul id="list" class="list"></ul>
+
+    <p id="done-hint" class="muted footer"></p>
+  </main>
+</body>
+</html>
