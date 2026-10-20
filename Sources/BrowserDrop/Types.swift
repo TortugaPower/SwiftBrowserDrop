@@ -107,6 +107,7 @@ public enum BrowserDropError: Error, Sendable, Equatable {
   /// The staging folder couldn't be created.
   case stagingUnavailable
   /// ``BrowserDropServer/finish(movingInto:)`` moved `moved` but couldn't move the items named in `failed`.
-  /// Staging was wiped either way.
+  /// They are kept, at ``BrowserDropServer/unmovedItems``: move them yourself or delete them with
+  /// ``BrowserDropServer/removeLeftovers(in:)``.
   case couldNotMove(moved: [URL], failed: [String])
 }

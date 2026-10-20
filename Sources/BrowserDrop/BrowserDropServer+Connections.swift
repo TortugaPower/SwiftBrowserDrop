@@ -22,6 +22,12 @@ extension BrowserDropServer {
 
   /// Serves one request, then returns, which closes the connection.
   func serve(_ connection: NetworkConnection<TCP>) async {
+    guard activeConnections < configuration.maximumConnections else { return }
+    activeConnections += 1
+    defer { activeConnections -= 1 }
+
+    // The whole head has to arrive within the idle timeout, not just each piece of it.
+    let headDeadline = ContinuousClock.now + configuration.idleTimeout
     var buffer = Data()
     while true {
       if let end = buffer.range(of: Data("\r\n\r\n".utf8)) {
@@ -42,7 +48,7 @@ extension BrowserDropServer {
         await send(.error(431, "headers_too_large", "Request headers are too large."), on: connection)
         return
       }
-      guard case .data(let data) = await receive(from: connection) else { return }
+      guard case .data(let data) = await receive(from: connection, until: headDeadline) else { return }
       buffer.append(data)
     }
   }
@@ -153,9 +159,10 @@ extension BrowserDropServer {
     }
     try? handle.close()
 
+    var replacedOthers = false
     if failure == nil {
       do {
-        try staging.commit(incomingFile, to: relativePath)
+        replacedOthers = try staging.commit(incomingFile, to: relativePath)
       } catch {
         failure = .writeFailed
       }
@@ -174,8 +181,10 @@ extension BrowserDropServer {
       return
     }
 
+    // The last upload wins: whatever it replaced (a folder's files, a file in the way) leaves the list.
+    if replacedOthers { receivedFiles.removeAll { !staging.containsFile(at: $0.relativePath) } }
     let file = ReceivedFile(relativePath: relativePath, size: size)
-    if let index = receivedFiles.firstIndex(where: { $0.relativePath == relativePath }) {
+    if let index = receivedFiles.firstIndex(where: { staging.isSameFile($0.relativePath, relativePath) }) {
       receivedFiles[index] = file
     } else {
       receivedFiles.append(file)
@@ -204,8 +213,9 @@ extension BrowserDropServer {
   ///
   /// `receive` returns empty data both when the browser closes the connection and when the session cancels
   /// this task; `Task.isCancelled` tells them apart.
-  nonisolated func receive(from connection: NetworkConnection<TCP>) async -> Chunk {
-    let timeout = configuration.idleTimeout
+  /// `deadline` cuts the wait short of ``Configuration/idleTimeout``.
+  nonisolated func receive(from connection: NetworkConnection<TCP>, until deadline: ContinuousClock.Instant? = nil) async -> Chunk {
+    let timeout = deadline.map { min(configuration.idleTimeout, max(.zero, $0 - ContinuousClock.now)) } ?? configuration.idleTimeout
     return await withTaskGroup(of: Chunk.self) { group in
       group.addTask {
         let content = (try? await connection.receive(atLeast: 1, atMost: Self.receiveChunk).content) ?? Data()
@@ -236,8 +246,9 @@ extension BrowserDropServer {
   private func refuse(_ response: HTTPResponse, unread: Int64, on connection: NetworkConnection<TCP>) async {
     await send(response, on: connection)
     guard unread > 0, unread <= Self.drainLimit else { return }
+    let deadline = ContinuousClock.now + configuration.idleTimeout
     var left = unread
-    while left > 0, case .data(let data) = await receive(from: connection) {
+    while left > 0, case .data(let data) = await receive(from: connection, until: deadline) {
       left -= Int64(data.count)
     }
   }

@@ -13,6 +13,7 @@ import os
 /// and ends every connection, and the task only finishes once they all have.
 public actor BrowserDropServer {
   /// The session's events, for a single consumer. The stream finishes when the session closes.
+  /// Nothing is dropped: events wait in memory until they're read, so keep reading while the session runs.
   public nonisolated let events: AsyncStream<Event>
   public nonisolated let configuration: Configuration
 
@@ -21,6 +22,8 @@ public actor BrowserDropServer {
   public internal(set) var receivedFiles: [ReceivedFile] = []
   /// Where the page can be opened, best first. Empty unless running.
   public private(set) var addresses: [Address] = []
+  /// What ``finish(movingInto:)`` couldn't move, kept on disk so nothing is lost. Empty otherwise.
+  public private(set) var unmovedItems: [URL] = []
 
   let logger = Logger(subsystem: "com.tortugapower.BrowserDrop", category: "server")
   private let eventSink: AsyncStream<Event>.Continuation
@@ -29,6 +32,8 @@ public actor BrowserDropServer {
   /// Uploads in progress, for the free-space check: what each still has to write.
   var inFlight: [Int: (size: Int64, received: Int64)] = [:]
   var nextUploadID = 0
+  /// Connections being served, for ``Configuration/maximumConnections``.
+  var activeConnections = 0
 
   /// Runs `NetworkListener.run`. When it finishes, every connection has ended and the port is free.
   private var listenerTask: Task<Void, Never>?
@@ -38,7 +43,7 @@ public actor BrowserDropServer {
 
   public init(configuration: Configuration = Configuration()) {
     self.configuration = configuration
-    (events, eventSink) = AsyncStream.makeStream(of: Event.self, bufferingPolicy: .bufferingNewest(1_000))
+    (events, eventSink) = AsyncStream.makeStream(of: Event.self, bufferingPolicy: .unbounded)
   }
 
   deinit {
@@ -121,20 +126,19 @@ public actor BrowserDropServer {
   /// Ends the session and moves every complete upload into `destination`, keeping folder structure.
   /// In-flight uploads are dropped. Names already taken in `destination` get ` (1)`, ` (2)`…
   ///
-  /// Returns the moved top-level files and folders. Staging is wiped either way.
+  /// Returns the moved top-level files and folders. If some can't be moved, it throws
+  /// ``BrowserDropError/couldNotMove(moved:failed:)`` and those items stay in staging, at
+  /// ``unmovedItems`` until you move them or call ``removeLeftovers(in:)``. Otherwise staging is wiped.
   @discardableResult
   public func finish(movingInto destination: URL) async throws -> [URL] {
     guard state != .closed else { throw BrowserDropError.sessionClosed }
     await close()
     guard let staging else { return [] }
-    defer {
-      staging.remove()
-      self.staging = nil
-      receivedFiles = []
-    }
+    self.staging = nil
+    receivedFiles = []
 
     var moved: [URL] = []
-    var failed: [String] = []
+    var failed: [URL] = []
     for item in staging.topLevelItems() {
       let isDirectory = (try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
       let target = Staging.uniqueDestination(for: item.lastPathComponent, isDirectory: isDirectory, in: destination)
@@ -143,10 +147,15 @@ public actor BrowserDropServer {
         moved.append(target)
       } catch {
         logger.error("Couldn't move \(item.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
-        failed.append(item.lastPathComponent)
+        failed.append(item)
       }
     }
-    if !failed.isEmpty { throw BrowserDropError.couldNotMove(moved: moved, failed: failed) }
+    // Never delete what couldn't be handed over: it's the person's only copy.
+    if !failed.isEmpty {
+      unmovedItems = failed
+      throw BrowserDropError.couldNotMove(moved: moved, failed: failed.map(\.lastPathComponent))
+    }
+    staging.remove()
     return moved
   }
 
@@ -157,7 +166,8 @@ public actor BrowserDropServer {
     guard let staging, let segments = PathRules.segments(relativePath) else { return }
     let path = segments.joined(separator: "/")
     try staging.removeItem(at: path)
-    receivedFiles.removeAll { $0.relativePath == path || $0.relativePath.hasPrefix(path + "/") }
+    // Check the disk rather than the names: on a case-insensitive volume `book` removes `Book/01.mp3`.
+    receivedFiles.removeAll { !staging.containsFile(at: $0.relativePath) }
   }
 
   /// Ends the session and deletes everything that was uploaded.

@@ -24,18 +24,67 @@ struct Staging: Sendable {
     return (url, try FileHandle(forWritingTo: url))
   }
 
-  /// Moves a finished upload to its relative path, replacing an earlier upload of the same path.
-  func commit(_ incomingFile: URL, to relativePath: String) throws {
+  /// Moves a finished upload to its relative path, replacing whatever is in the way, so the last upload
+  /// wins: an earlier upload of the same path, a folder of earlier uploads at that path, or an earlier file
+  /// where one of its folders goes (`x` for `x/y.mp3`). Returns whether it replaced anything but a file
+  /// at the same path.
+  @discardableResult
+  func commit(_ incomingFile: URL, to relativePath: String) throws -> Bool {
     let destination = files.appendingPathComponent(relativePath, isDirectory: false)
-    try FileManager.default.createDirectory(
-      at: destination.deletingLastPathComponent(),
-      withIntermediateDirectories: true
-    )
-    if FileManager.default.fileExists(atPath: destination.path) {
-      _ = try FileManager.default.replaceItemAt(destination, withItemAt: incomingFile)
-    } else {
-      try FileManager.default.moveItem(at: incomingFile, to: destination)
+
+    // A file where a folder of this path goes: set it aside, and put it back if the commit fails.
+    var blocking: (file: URL, backup: URL)?
+    var ancestor = files
+    for segment in relativePath.split(separator: "/").dropLast() {
+      ancestor = ancestor.appendingPathComponent(String(segment), isDirectory: true)
+      var isDirectory: ObjCBool = false
+      if FileManager.default.fileExists(atPath: ancestor.path, isDirectory: &isDirectory), !isDirectory.boolValue {
+        let backup = incoming.appendingPathComponent(UUID().uuidString, isDirectory: false)
+        try FileManager.default.moveItem(at: ancestor, to: backup)
+        blocking = (ancestor, backup)
+        break
+      }
     }
+
+    do {
+      try FileManager.default.createDirectory(
+        at: destination.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+      )
+      var replacedFolder = false
+      var isDirectory: ObjCBool = false
+      if FileManager.default.fileExists(atPath: destination.path, isDirectory: &isDirectory) {
+        _ = try FileManager.default.replaceItemAt(destination, withItemAt: incomingFile)
+        replacedFolder = isDirectory.boolValue
+      } else {
+        try FileManager.default.moveItem(at: incomingFile, to: destination)
+      }
+      if let blocking { try? FileManager.default.removeItem(at: blocking.backup) }
+      return replacedFolder || blocking != nil
+    } catch {
+      if let blocking {
+        try? FileManager.default.removeItem(at: blocking.file)  // the folder this commit may have created
+        try? FileManager.default.moveItem(at: blocking.backup, to: blocking.file)
+      }
+      throw error
+    }
+  }
+
+  func containsFile(at relativePath: String) -> Bool {
+    var isDirectory: ObjCBool = false
+    let exists = FileManager.default.fileExists(atPath: files.appendingPathComponent(relativePath).path, isDirectory: &isDirectory)
+    return exists && !isDirectory.boolValue
+  }
+
+  /// Whether two relative paths name the same file. On a case-insensitive volume `a.mp3` and `A.mp3` do.
+  func isSameFile(_ lhs: String, _ rhs: String) -> Bool {
+    if lhs == rhs { return true }
+    guard lhs.caseInsensitiveCompare(rhs) == .orderedSame else { return false }
+    func identifier(_ path: String) -> (any NSCopying & NSSecureCoding & NSObjectProtocol)? {
+      try? files.appendingPathComponent(path).resourceValues(forKeys: [.fileResourceIdentifierKey]).fileResourceIdentifier
+    }
+    guard let left = identifier(lhs), let right = identifier(rhs) else { return false }
+    return left.isEqual(right)
   }
 
   /// The top-level files and folders under `files`, in Finder order.
@@ -70,11 +119,14 @@ struct Staging: Sendable {
     let first = directory.appendingPathComponent(name, isDirectory: isDirectory)
     guard FileManager.default.fileExists(atPath: first.path) else { return first }
 
-    let base = isDirectory ? name : (name as NSString).deletingPathExtension
+    var base = isDirectory ? name : (name as NSString).deletingPathExtension
     let fileExtension = isDirectory ? "" : (name as NSString).pathExtension
     var index = 1
     while true {
-      let candidateName = fileExtension.isEmpty ? "\(base) (\(index))" : "\(base) (\(index)).\(fileExtension)"
+      let suffix = fileExtension.isEmpty ? " (\(index))" : " (\(index)).\(fileExtension)"
+      // Names are limited to 255 bytes: shorten the base so the suffix still fits.
+      while !base.isEmpty, base.utf8.count + suffix.utf8.count > PathRules.maximumSegmentBytes { base.removeLast() }
+      let candidateName = base + suffix
       let candidate = directory.appendingPathComponent(candidateName, isDirectory: isDirectory)
       if !FileManager.default.fileExists(atPath: candidate.path) { return candidate }
       index += 1

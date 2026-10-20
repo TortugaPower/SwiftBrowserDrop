@@ -95,20 +95,28 @@ final class RawClient: @unchecked Sendable {
     connection = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
   }
 
-  func open() async throws {
+  /// Connects, giving up after `timeout`. `.waiting` isn't a failure: the connection retries on its own
+  /// from it, as a browser would (a busy loopback can refuse one attempt with "address in use").
+  func open(timeout: Duration = .seconds(3)) async throws {
     let resumed = OSAllocatedUnfairLock(initialState: false)
+    let lastError = OSAllocatedUnfairLock<(any Error)?>(initialState: nil)
     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-      connection.stateUpdateHandler = { state in
-        let result: Result<Void, any Error>?
-        switch state {
-        case .ready: result = .success(())
-        case .failed(let error), .waiting(let error): result = .failure(error)
-        default: result = nil
-        }
-        guard let result, !resumed.withLock({ defer { $0 = true }; return $0 }) else { return }
+      let finish: @Sendable (Result<Void, any Error>) -> Void = { result in
+        guard !resumed.withLock({ defer { $0 = true }; return $0 }) else { return }
         continuation.resume(with: result)
       }
+      connection.stateUpdateHandler = { state in
+        switch state {
+        case .ready: finish(.success(()))
+        case .failed(let error): finish(.failure(error))
+        case .waiting(let error): lastError.withLock { $0 = error }
+        default: break
+        }
+      }
       connection.start(queue: queue)
+      queue.asyncAfter(deadline: .now() + timeout.timeInterval) {
+        finish(.failure(lastError.withLock { $0 } ?? TestFailure("connect timed out")))
+      }
     }
   }
 

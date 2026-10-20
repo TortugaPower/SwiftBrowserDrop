@@ -11,8 +11,12 @@ extension BrowserDropServer {
     public var reservedFreeSpace: Int64
     /// How many uploads the bundled page runs at once. Sent to the page in `config.json`.
     public var maximumConcurrentUploads: Int
-    /// A connection that sends nothing for this long is closed. A stalled upload fails as ``FailureReason/timedOut``.
+    /// A connection that sends nothing for this long is closed, and so is one that takes this long to send
+    /// its request head. A stalled upload fails as ``FailureReason/timedOut``.
     public var idleTimeout: Duration
+    /// Connections served at once; more are closed right away. Each holds a file descriptor, and an iOS app
+    /// has only 256 by default, so this keeps other devices on the network from exhausting the app's.
+    public var maximumConnections = 64
     public var page: Page
     public var pageSettings: PageSettings
     /// The folder that holds each session's staging folder. ``BrowserDropServer/removeLeftovers(in:)`` empties it.

@@ -63,6 +63,9 @@ await server.cancel()
 
 `receivedFiles` always lists what's complete. Uploading the same relative path again replaces that file,
 so retries never create duplicates. Names already taken in the destination get ` (1)`, ` (2)`…
+If something can't be moved, `finish` throws `couldNotMove(moved:failed:)` and keeps those items on disk at
+`unmovedItems`, so nothing is lost; move them yourself or call `removeLeftovers()`. Read `events`
+for the whole session: they wait in memory until read.
 
 To drop something the person changed their mind about, call `removeReceivedItem(at:)` with a file's
 relative path, or with a folder (`Book`) to drop it and everything in it. It won't be handed over.
@@ -96,7 +99,13 @@ the person to accept it in your app. So it has **no password or pairing code by 
   control characters are refused, and so are file types not in `allowedExtensions`.
 - **Size and space.** Files over `maximumFileSize` get 413. An upload that would leave less than
   `reservedFreeSpace` on the device gets 507, counting what in-flight uploads still have to write.
-- **Quiet connections** are closed after `idleTimeout`.
+- **Quiet connections.** A connection that sends nothing for `idleTimeout`, or takes longer than that to
+  send its request head, is closed. Slow uploads are left alone, however slow: on bad Wi‑Fi they still finish.
+- **Connections** are capped at `maximumConnections` (64 by default); more are closed right away, so other
+  devices can't exhaust the app's file descriptors.
+- **The last upload wins.** A file uploaded at the path of a folder of earlier uploads replaces that folder,
+  and an upload into a folder whose name an earlier file has (`x/y.mp3` after `x`) replaces that file. What
+  was replaced leaves `receivedFiles`.
 - **Nothing else.** Only `GET` (the page and `config.json`) and `POST /upload` exist. No directory listings,
   and page files can't be served from outside the page folder, symlinks included.
 
