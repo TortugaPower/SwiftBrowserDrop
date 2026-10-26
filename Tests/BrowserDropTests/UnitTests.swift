@@ -233,6 +233,45 @@ struct StagingTests {
     #expect(!staging.conflicts(at: "Other.mp3"))
   }
 
+  @Test func refusesWhenAFolderCantBeListed() throws {
+    let staging = try Staging.create(in: makeTemporaryDirectory())
+    defer { staging.remove() }
+    try store("a", at: "Book/01.mp3", in: staging)
+    let book = staging.files.appendingPathComponent("Book")
+    try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: book.path)
+    defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: book.path) }
+
+    // Out of descriptors would look the same: what's there can't be known, so nothing is let through.
+    #expect(staging.conflicts(at: "Book/02.mp3"))
+  }
+
+  @Test func aMissingSessionFolderHidesNothing() throws {
+    let staging = try Staging.create(in: makeTemporaryDirectory())
+    defer { staging.remove() }
+    try FileManager.default.removeItem(at: staging.files)
+    #expect(!staging.conflicts(at: "a.mp3"))
+  }
+
+  /// Osage capital and small letters are one name to APFS, but Foundation compares them as different: the
+  /// check misses them, and storing refuses them instead of replacing or merging.
+  @Test(.enabled(if: temporaryVolumeIsCaseInsensitive))
+  func refusesNamesTheVolumeEquatesThatCompareAsDifferent() throws {
+    let staging = try Staging.create(in: makeTemporaryDirectory())
+    defer { staging.remove() }
+    let capital = "\u{104B0}"
+    let small = "\u{104D8}"
+    try store("file", at: "\(capital).mp3", in: staging)
+    try store("chapter", at: "\(capital)/01.mp3", in: staging)
+
+    #expect(throws: Staging.PathConflict.self) { try store("x", at: "\(small).mp3", in: staging) }
+    #expect(throws: Staging.PathConflict.self) { try store("x", at: "\(small)/01.mp3", in: staging) }
+    #expect(throws: Staging.PathConflict.self) { try store("x", at: "\(small)/02.mp3", in: staging) }
+    #expect(try String(contentsOf: staging.files.appendingPathComponent("\(capital).mp3"), encoding: .utf8) == "file")
+    #expect(try String(contentsOf: staging.files.appendingPathComponent("\(capital)/01.mp3"), encoding: .utf8) == "chapter")
+    #expect(try names(in: staging.files.appendingPathComponent(capital)) == ["01.mp3"])
+    #expect(try FileManager.default.contentsOfDirectory(atPath: staging.incoming.path).isEmpty)
+  }
+
   @Test(.enabled(if: temporaryVolumeIsCaseInsensitive))
   func refusesANameInAnotherCaseOnACaseInsensitiveVolume() throws {
     let staging = try Staging.create(in: makeTemporaryDirectory())
