@@ -52,6 +52,7 @@ struct HTTPResponse {
     case 404: "Not Found"
     case 405: "Method Not Allowed"
     case 408: "Request Timeout"
+    case 409: "Conflict"
     case 411: "Length Required"
     case 413: "Content Too Large"
     case 431: "Request Header Fields Too Large"

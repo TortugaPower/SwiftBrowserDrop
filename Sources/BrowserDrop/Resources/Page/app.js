@@ -19,6 +19,7 @@ const DEFAULT_STRINGS = {
   notEnoughSpace: 'Not enough space on the device',
   tooLarge: 'Too large',
   unsupported: 'File type not supported',
+  pathConflict: 'Another file or folder you sent has this name',
   skipped: 'Skipped because the type isn’t supported: {count}',
   retry: 'Retry failed',
   doneHint: 'When you’re done, confirm on your device to import the files.',
@@ -252,7 +253,9 @@ function failureText(status, body) {
   if (status === 507) return t('notEnoughSpace');
   if (status === 413) return t('tooLarge');
   try {
-    if (JSON.parse(body).error === 'unsupported_type') return t('unsupported');
+    const code = JSON.parse(body).error;
+    if (code === 'unsupported_type') return t('unsupported');
+    if (code === 'path_conflict') return t('pathConflict');
   } catch {
     // Not JSON: fall through.
   }

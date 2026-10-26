@@ -6,13 +6,16 @@ extension BrowserDropServer {
   /// instead of a reset.
   static let drainLimit: Int64 = 8 << 20
   static let receiveChunk = 256 * 1024
+  static let pathConflict = HTTPResponse.error(
+    409, "path_conflict", "Another file or folder sent in this session already has this name."
+  )
 
   /// What one read from the browser gave.
   enum Chunk: Sendable {
     case data(Data)
     /// The browser closed the connection.
     case closed
-    /// The session stopped: ``suspend()``, ``finish(movingInto:)`` or ``cancel()``.
+    /// The session stopped: ``suspend()``, ``finish()`` or ``cancel()``.
     case cancelled
     /// Nothing arrived for ``Configuration/idleTimeout``.
     case timedOut
@@ -100,6 +103,11 @@ extension BrowserDropServer {
       return
     }
 
+    if let staging, staging.conflicts(at: relativePath) {
+      emit(.uploadFailed(relativePath: relativePath, reason: .pathConflict))
+      await refuse(Self.pathConflict, unread: unread, on: connection)
+      return
+    }
     guard size <= configuration.maximumFileSize else {
       emit(.uploadFailed(relativePath: relativePath, reason: .tooLarge))
       await refuse(.error(413, "too_large", "The file is larger than this device accepts."), unread: unread, on: connection)
@@ -118,9 +126,13 @@ extension BrowserDropServer {
 
     nextUploadID += 1
     let upload = Upload(id: nextUploadID, relativePath: relativePath, size: size)
-    inFlight[upload.id] = (size, 0)
-    defer { inFlight[upload.id] = nil }
+    inFlight[upload.id] = UploadProgress(upload: upload, receivedBytes: 0)
+    // Normally it leaves the list before its final event (below); this covers every other way out.
+    defer {
+      if inFlight.removeValue(forKey: upload.id) != nil { publishProgress() }
+    }
     emit(.uploadStarted(upload))
+    publishProgress()
 
     if head.expectsContinue, body.isEmpty, size > 0 {
       try? await connection.send(HTTPResponse.continueInterim)
@@ -151,22 +163,28 @@ extension BrowserDropServer {
         break
       }
       received += Int64(chunk.count)
-      inFlight[upload.id] = (size, received)
+      inFlight[upload.id] = UploadProgress(upload: upload, receivedBytes: received)
       if received < size, received - reported >= progressStep {
         reported = received
-        emit(.uploadProgress(upload, receivedBytes: received))
+        publishProgress()
       }
     }
     try? handle.close()
 
-    var replacedOthers = false
     if failure == nil {
+      // Checked again here, where it can't race: another upload may have taken the name meanwhile.
       do {
-        replacedOthers = try staging.commit(incomingFile, to: relativePath)
+        try staging.commit(incomingFile, to: relativePath)
+      } catch is Staging.PathConflict {
+        failure = .pathConflict
       } catch {
         failure = .writeFailed
       }
     }
+    // Out of the in-flight list before the final event, so no list shows it once it's finished or failed.
+    inFlight[upload.id] = nil
+    publishProgress()
+
     if let failure {
       try? FileManager.default.removeItem(at: incomingFile)
       emit(.uploadFailed(relativePath: relativePath, reason: failure))
@@ -175,21 +193,20 @@ extension BrowserDropServer {
         await send(.error(507, "insufficient_storage", "There isn't enough free space on this device."), on: connection)
       case .writeFailed:
         await send(.error(500, "write_failed", "The file couldn't be written."), on: connection)
+      case .pathConflict:
+        await send(Self.pathConflict, on: connection)
       default:
         break  // The connection is gone or the session stopped: nobody to answer.
       }
       return
     }
 
-    // The last upload wins: whatever it replaced (a folder's files, a file in the way) leaves the list.
-    if replacedOthers { receivedFiles.removeAll { !staging.containsFile(at: $0.relativePath) } }
     let file = ReceivedFile(relativePath: relativePath, size: size)
-    if let index = receivedFiles.firstIndex(where: { staging.isSameFile($0.relativePath, relativePath) }) {
+    if let index = receivedFiles.firstIndex(where: { $0.relativePath == relativePath }) {
       receivedFiles[index] = file
     } else {
       receivedFiles.append(file)
     }
-    emit(.uploadProgress(upload, receivedBytes: size))
     emit(.uploadFinished(file))
     await send(.json(201, ["path": relativePath]), on: connection)
   }
@@ -197,8 +214,10 @@ extension BrowserDropServer {
   /// Whether `size` more bytes leave ``Configuration/reservedFreeSpace`` free, counting what the uploads
   /// already in flight still have to write.
   private func hasRoom(for size: Int64, in staging: Staging) -> Bool {
-    guard let available = configuration.availableCapacity(staging.root) else { return true }
-    let pending = inFlight.values.reduce(Int64(0)) { $0 + $1.size - $1.received }
+    // A fresh URL each time: URLs cache resource values, so a reused one would keep answering with the
+    // free space of the first check, in the default reader and in an app's own alike.
+    guard let available = configuration.availableCapacity(URL(fileURLWithPath: staging.files.path)) else { return true }
+    let pending = inFlight.values.reduce(Int64(0)) { $0 + $1.upload.size - $1.receivedBytes }
     return available - pending - size >= configuration.reservedFreeSpace
   }
 

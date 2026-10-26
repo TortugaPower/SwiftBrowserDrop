@@ -17,31 +17,41 @@ struct ServerTests {
     #expect(try await upload(Data("two".utf8), as: "Book/02.mp3", port: port) == 201)
     #expect(try await upload(Data("loose".utf8), as: "loose.m4b", port: port) == 201)
     #expect(await server.receivedFiles.map(\.relativePath).sorted() == ["Book/02.mp3", "Book/Disc 1/01.mp3", "loose.m4b"])
+    let incoming = try #require(await server.staging?.incoming)
 
-    let destination = makeTemporaryDirectory()
-    #expect(try FileManager.default.contentsOfDirectory(atPath: destination.path).isEmpty)
-    let moved = try await server.finish(movingInto: destination)
+    let folder = try #require(try await server.finish())
 
-    #expect(moved.map(\.lastPathComponent) == ["Book", "loose.m4b"])
-    let first = try String(contentsOf: destination.appendingPathComponent("Book/Disc 1/01.mp3"), encoding: .utf8)
+    #expect(try names(in: folder) == ["Book", "loose.m4b"])
+    let first = try String(contentsOf: folder.appendingPathComponent("Book/Disc 1/01.mp3"), encoding: .utf8)
     #expect(first == "one")
+    #expect(!FileManager.default.fileExists(atPath: incoming.path))
     #expect(await server.state == .closed)
     #expect(await server.receivedFiles.isEmpty)
+    #expect(await server.staging == nil)
   }
 
-  @Test func finishNumbersNamesTakenInTheDestination() async throws {
+  @Test func finishHandsOverNothingWhenNothingArrived() async throws {
     let server = makeServer()
     try await server.start()
-    let port = try await runningPort(server)
-    _ = try await upload(Data("a".utf8), as: "Book/01.mp3", port: port)
-    _ = try await upload(Data("b".utf8), as: "loose.m4b", port: port)
+    let staging = try #require(await server.staging)
 
-    let destination = makeTemporaryDirectory()
-    try FileManager.default.createDirectory(at: destination.appendingPathComponent("Book"), withIntermediateDirectories: true)
-    try Data().write(to: destination.appendingPathComponent("loose.m4b"))
+    #expect(try await server.finish() == nil)
+    #expect(!FileManager.default.fileExists(atPath: staging.files.path))
+    #expect(!FileManager.default.fileExists(atPath: staging.incoming.path))
+    await #expect(throws: BrowserDropError.sessionClosed) { try await server.finish() }
+  }
 
-    let moved = try await server.finish(movingInto: destination)
-    #expect(moved.map(\.lastPathComponent) == ["Book (1)", "loose (1).m4b"])
+  @Test func theHandedOverFolderOutlivesTheServer() async throws {
+    var server: BrowserDropServer? = makeServer()
+    try await server?.start()
+    let port = try await runningPort(try #require(server))
+    _ = try await upload(Data("a".utf8), as: "a.mp3", port: port)
+    let folder = try #require(try await server?.finish())
+
+    weak let released = server
+    server = nil
+    #expect(released == nil)
+    #expect(FileManager.default.fileExists(atPath: folder.appendingPathComponent("a.mp3").path))
   }
 
   @Test func uploadingAPathAgainReplacesTheFile() async throws {
@@ -53,9 +63,8 @@ struct ServerTests {
     #expect(try await upload(Data("second!".utf8), as: "a.mp3", port: port) == 201)
     #expect(await server.receivedFiles == [BrowserDropServer.ReceivedFile(relativePath: "a.mp3", size: 7)])
 
-    let destination = makeTemporaryDirectory()
-    try await server.finish(movingInto: destination)
-    #expect(try String(contentsOf: destination.appendingPathComponent("a.mp3"), encoding: .utf8) == "second!")
+    let folder = try #require(try await server.finish())
+    #expect(try String(contentsOf: folder.appendingPathComponent("a.mp3"), encoding: .utf8) == "second!")
   }
 
   @Test func suspendAndResumeKeepThePortAndTheFiles() async throws {
@@ -124,9 +133,8 @@ struct ServerTests {
     #expect(await server.receivedFiles.map(\.relativePath) == ["loose.mp3"])
 
     // The emptied "Other" folder is gone too, so it isn't handed over as an empty item.
-    let destination = makeTemporaryDirectory()
-    let moved = try await server.finish(movingInto: destination)
-    #expect(moved.map(\.lastPathComponent) == ["loose.mp3"])
+    let folder = try #require(try await server.finish())
+    #expect(try names(in: folder) == ["loose.mp3"])
   }
 
   @Test func aRemovedPathCanBeUploadedAgain() async throws {
@@ -147,12 +155,13 @@ struct ServerTests {
     try await server.start()
     let port = try await runningPort(server)
     _ = try await upload(Data("a".utf8), as: "a.mp3", port: port)
-    let stagingFolder = try #require(await server.staging?.root)
-    #expect(FileManager.default.fileExists(atPath: stagingFolder.path))
+    let staging = try #require(await server.staging)
+    #expect(FileManager.default.fileExists(atPath: staging.files.path))
 
     await server.cancel()
     #expect(await server.state == .closed)
-    #expect(!FileManager.default.fileExists(atPath: stagingFolder.path))
+    #expect(!FileManager.default.fileExists(atPath: staging.files.path))
+    #expect(!FileManager.default.fileExists(atPath: staging.incoming.path))
     await #expect(throws: BrowserDropError.sessionClosed) {
       try await server.start()
     }
@@ -170,13 +179,26 @@ struct ServerTests {
   @Test func reportsAnUploadFromStartToFinish() async throws {
     let server = makeServer()
     let recorder = EventRecorder(server)
+    let progress = ProgressRecorder(server)
     try await server.start()
     let port = try await runningPort(server)
 
-    let size = 3 << 20
-    #expect(try await upload(Data(count: size), as: "Book/big.mp3", port: port) == 201)
+    // Sent in two halves, waiting in between, so the upload is seen in flight whatever the timing.
+    let size = 2 << 20
+    let client = RawClient(port: port)
+    try await client.open()
+    try await client.send("POST /upload?path=Book/big.mp3 HTTP/1.1\r\nHost: 127.0.0.1:\(port)\r\nContent-Length: \(size)\r\n\r\n")
+    try await client.send(Data(count: size / 2))
+    try await eventually("upload in progress") {
+      progress.snapshots.last?.first.map { $0.upload.relativePath == "Book/big.mp3" && $0.receivedBytes >= 512 << 10 } ?? false
+    }
+    try await client.send(Data(count: size / 2))
+    #expect(RawClient.status(of: try await client.receive(until: "\r\n\r\n")) == 201)
+    client.close()
+
     let file = BrowserDropServer.ReceivedFile(relativePath: "Book/big.mp3", size: Int64(size))
     try await eventually("finished event") { recorder.contains(.uploadFinished(file)) }
+    try await eventually("upload left the progress list") { progress.snapshots.last == [] }
 
     let events = recorder.events
     guard case .uploadStarted(let started) = events.first else {
@@ -185,8 +207,33 @@ struct ServerTests {
     }
     #expect(started.relativePath == "Book/big.mp3")
     #expect(started.size == Int64(size))
-    #expect(events.contains(.uploadProgress(started, receivedBytes: Int64(size))))
-    #expect(events.last == .uploadFinished(file))
+    #expect(events == [.uploadStarted(started), .uploadFinished(file)])
+    let received = progress.snapshots.flatMap { $0 }.filter { $0.upload == started }.map(\.receivedBytes)
+    #expect(received == received.sorted())
+    await server.cancel()
+  }
+
+  @Test func aLateProgressReaderGetsOnlyTheCurrentList() async throws {
+    let server = makeServer()
+    try await server.start()
+    let port = try await runningPort(server)
+
+    let client = RawClient(port: port)
+    try await client.open()
+    try await client.send("POST /upload?path=a.mp3 HTTP/1.1\r\nHost: 127.0.0.1:\(port)\r\nContent-Length: \(2 << 20)\r\n\r\n")
+    try await client.send(Data(count: 1 << 20))
+    try await eventually("upload written") {
+      await server.inFlight.values.first.map { $0.receivedBytes == 1 << 20 } ?? false
+    }
+
+    // The start (0 bytes) and the steps since were all superseded: only the newest list is waiting.
+    let progress = ProgressRecorder(server)
+    try await eventually("current list") { !progress.snapshots.isEmpty }
+    try await Task.sleep(for: .milliseconds(100))
+    // Steps are published every 512 KiB, so the newest is somewhere past the first step.
+    #expect(progress.snapshots.count == 1)
+    #expect((progress.snapshots.first?.first?.receivedBytes ?? 0) >= 512 << 10)
+    client.close()
     await server.cancel()
   }
 

@@ -156,28 +156,92 @@ struct InterfaceAddressesTests {
 
 @Suite("Staging")
 struct StagingTests {
-  @Test func numbersTakenNames() throws {
-    let directory = makeTemporaryDirectory()
-    try FileManager.default.createDirectory(at: directory.appendingPathComponent("Book"), withIntermediateDirectories: true)
-    try Data().write(to: directory.appendingPathComponent("a.mp3"))
-    try Data().write(to: directory.appendingPathComponent("a (1).mp3"))
+  /// Stores `text` at `path` the way a finished upload is.
+  private func store(_ text: String, at path: String, in staging: Staging) throws {
+    let (url, handle) = try staging.makeIncomingFile()
+    try handle.write(contentsOf: Data(text.utf8))
+    try handle.close()
+    do {
+      try staging.commit(url, to: path)
+    } catch {
+      try? FileManager.default.removeItem(at: url)
+      throw error
+    }
+  }
 
-    #expect(Staging.uniqueDestination(for: "Book", isDirectory: true, in: directory).lastPathComponent == "Book (1)")
-    #expect(Staging.uniqueDestination(for: "a.mp3", isDirectory: false, in: directory).lastPathComponent == "a (2).mp3")
-    #expect(Staging.uniqueDestination(for: "new.mp3", isDirectory: false, in: directory).lastPathComponent == "new.mp3")
+  @Test func readsFreeSpaceAfreshEachTime() throws {
+    // The server checks free space with the same URL all session, and URLs cache resource values: every
+    // check after the first must still see what's free now.
+    let folder = makeTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let before = try #require(BrowserDropServer.volumeAvailableCapacity(folder))
+    try Data(count: 128 << 20).write(to: folder.appendingPathComponent("filler"))
+    let after = try #require(BrowserDropServer.volumeAvailableCapacity(folder))
+    #expect(before - after >= 64 << 20, "read \(before) bytes free, then \(after) after writing 128 MB")
+  }
+
+  @Test func keepsIncomingUploadsBesideTheSessionFolder() throws {
+    let root = makeTemporaryDirectory()
+    let staging = try Staging.create(in: root)
+    #expect(staging.files.deletingLastPathComponent() == staging.incoming.deletingLastPathComponent())
+    #expect(staging.incoming.lastPathComponent == staging.files.lastPathComponent + ".incoming")
+    staging.remove()
+    #expect(try names(in: root).isEmpty)
   }
 
   @Test func commitReplacesAnEarlierUpload() throws {
     let staging = try Staging.create(in: makeTemporaryDirectory())
     defer { staging.remove() }
-    for text in ["first", "second"] {
-      let (url, handle) = try staging.makeIncomingFile()
-      try handle.write(contentsOf: Data(text.utf8))
-      try handle.close()
-      try staging.commit(url, to: "Book/01.mp3")
-    }
+    try store("first", at: "Book/01.mp3", in: staging)
+    try store("second", at: "Book/01.mp3", in: staging)
     let stored = try String(contentsOf: staging.files.appendingPathComponent("Book/01.mp3"), encoding: .utf8)
     #expect(stored == "second")
     #expect(try FileManager.default.contentsOfDirectory(atPath: staging.incoming.path).isEmpty)
+  }
+
+  @Test func refusesAFileWhereAFolderIs() throws {
+    let staging = try Staging.create(in: makeTemporaryDirectory())
+    defer { staging.remove() }
+    try store("chapter", at: "Book.mp3/01.mp3", in: staging)
+
+    #expect(staging.conflicts(at: "Book.mp3"))
+    #expect(throws: Staging.PathConflict.self) { try store("x", at: "Book.mp3", in: staging) }
+    #expect(staging.containsFile(at: "Book.mp3/01.mp3"))
+  }
+
+  @Test func refusesAFolderWhereAFileIs() throws {
+    let staging = try Staging.create(in: makeTemporaryDirectory())
+    defer { staging.remove() }
+    try store("x", at: "Book.mp3", in: staging)
+
+    #expect(staging.conflicts(at: "Book.mp3/01.mp3"))
+    #expect(staging.conflicts(at: "Book.mp3/Disc 1/01.mp3"))
+    #expect(throws: Staging.PathConflict.self) { try store("chapter", at: "Book.mp3/01.mp3", in: staging) }
+    #expect(staging.containsFile(at: "Book.mp3"))
+  }
+
+  @Test func acceptsSiblingsDeeperFoldersAndTheSamePathAgain() throws {
+    let staging = try Staging.create(in: makeTemporaryDirectory())
+    defer { staging.remove() }
+    try store("a", at: "Book/01.mp3", in: staging)
+    try store("b", at: "Café/01.mp3", in: staging)
+
+    #expect(!staging.conflicts(at: "Book/01.mp3"))
+    #expect(!staging.conflicts(at: "Book/02.mp3"))
+    #expect(!staging.conflicts(at: "Book/Disc 2/01.mp3"))
+    #expect(!staging.conflicts(at: "Café/02.mp3"))
+    #expect(!staging.conflicts(at: "Other.mp3"))
+  }
+
+  @Test(.enabled(if: temporaryVolumeIsCaseInsensitive))
+  func refusesANameInAnotherCaseOnACaseInsensitiveVolume() throws {
+    let staging = try Staging.create(in: makeTemporaryDirectory())
+    defer { staging.remove() }
+    try store("one", at: "Book/a.mp3", in: staging)
+
+    #expect(staging.conflicts(at: "Book/A.mp3"))
+    #expect(staging.conflicts(at: "book/b.mp3"))
+    #expect(throws: Staging.PathConflict.self) { try store("two", at: "Book/A.mp3", in: staging) }
+    #expect(try String(contentsOf: staging.files.appendingPathComponent("Book/a.mp3"), encoding: .utf8) == "one")
   }
 }
