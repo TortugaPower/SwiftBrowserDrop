@@ -236,7 +236,11 @@ with `POST /upload` as described above.
 
 ```sh
 swift test
+xcodebuild test -scheme SwiftBrowserDrop -destination 'platform=iOS Simulator,name=<a simulator>'
 ```
+
+Run both: the Simulator behaves differently from macOS in places that matter here (an app's file lookups
+there are case-sensitive while the Mac's volume underneath isn't).
 
 The tests run the real server on 127.0.0.1 and cover uploads, `finish`, suspend and resume (including quick
 restarts), aborted and stalled uploads, the request checks, and serving the page.
