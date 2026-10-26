@@ -11,11 +11,16 @@ extension BrowserDropServer {
     public var reservedFreeSpace: Int64
     /// How many uploads the bundled page runs at once. Sent to the page in `config.json`.
     public var maximumConcurrentUploads: Int
-    /// A connection that sends nothing for this long is closed. A stalled upload fails as ``FailureReason/timedOut``.
+    /// A connection that sends nothing for this long is closed, and so is one that takes this long to send
+    /// its request head. A stalled upload fails as ``FailureReason/timedOut``.
     public var idleTimeout: Duration
+    /// Connections served at once; more are closed right away. Each holds a file descriptor, and an iOS app
+    /// has only 256 by default, so this keeps other devices on the network from exhausting the app's.
+    public var maximumConnections: Int
     public var page: Page
     public var pageSettings: PageSettings
-    /// The folder that holds each session's staging folder. ``BrowserDropServer/removeLeftovers(in:)`` empties it.
+    /// The folder that holds each session's staging, and what ``BrowserDropServer/finish()`` handed over
+    /// until the app moves or deletes it. ``BrowserDropServer/removeLeftovers(in:)`` empties it.
     public var stagingRoot: URL
     /// Free bytes on the volume of a URL. Replace it in tests.
     public var availableCapacity: @Sendable (URL) -> Int64?
@@ -27,6 +32,7 @@ extension BrowserDropServer {
       reservedFreeSpace: Int64 = 256 << 20,
       maximumConcurrentUploads: Int = 3,
       idleTimeout: Duration = .seconds(60),
+      maximumConnections: Int = 64,
       page: Page = .bundled,
       pageSettings: PageSettings = PageSettings(),
       stagingRoot: URL = BrowserDropServer.defaultStagingRoot,
@@ -38,6 +44,7 @@ extension BrowserDropServer {
       self.reservedFreeSpace = reservedFreeSpace
       self.maximumConcurrentUploads = maximumConcurrentUploads
       self.idleTimeout = idleTimeout
+      self.maximumConnections = maximumConnections
       self.page = page
       self.pageSettings = pageSettings
       self.stagingRoot = stagingRoot
@@ -84,6 +91,10 @@ extension BrowserDropServer {
 
   @Sendable
   public static func volumeAvailableCapacity(_ url: URL) -> Int64? {
+    // A URL caches resource values, and the server passes the same one for the whole session: without
+    // this, every check would see the free space measured by the first.
+    var url = url
+    url.removeAllCachedResourceValues()
     let values = try? url.resourceValues(forKeys: [
       .volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey,
     ])
@@ -91,8 +102,8 @@ extension BrowserDropServer {
     return values?.volumeAvailableCapacity.map(Int64.init)
   }
 
-  /// Removes staging left by a session the app never finished or cancelled, for example after a crash.
-  /// Call it at launch, before creating any server.
+  /// Removes staging left by a session the app never finished or cancelled (after a crash, for example),
+  /// and any handed-over folder the app didn't move or delete. Call it at launch, before creating any server.
   public static func removeLeftovers(in stagingRoot: URL = defaultStagingRoot) {
     try? FileManager.default.removeItem(at: stagingRoot)
   }

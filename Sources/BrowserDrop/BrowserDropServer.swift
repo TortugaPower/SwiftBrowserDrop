@@ -5,15 +5,20 @@ import os
 /// A small HTTP server that lets a browser on the same network upload files into your app.
 ///
 /// One server is one session: ``start()`` it when your upload screen appears, ``suspend()`` and ``resume()``
-/// it around the app going to the background, then either ``finish(movingInto:)`` to keep what arrived or
-/// ``cancel()`` to throw it away. Uploads wait in a staging folder until then, and only complete files are
-/// ever handed over.
+/// it around the app going to the background, then either ``finish()`` to take what arrived or ``cancel()``
+/// to throw it away. Uploads wait in a staging folder until then, and only complete files are ever handed
+/// over.
 ///
 /// The listener runs in a task, and each connection is a child of it: cancelling that task stops listening
 /// and ends every connection, and the task only finishes once they all have.
 public actor BrowserDropServer {
-  /// The session's events, for a single consumer. The stream finishes when the session closes.
+  /// The session's events: a couple per upload, and network changes. For a single consumer. Nothing is
+  /// dropped, so read it for the whole session. The stream finishes when the session closes.
   public nonisolated let events: AsyncStream<Event>
+  /// The uploads in flight and how much of each has arrived, as a list replaced as they move. Only the newest
+  /// list is kept, so a reader that falls behind skips to the current one. For a single consumer; the
+  /// stream finishes when the session closes.
+  public nonisolated let progress: AsyncStream<[UploadProgress]>
   public nonisolated let configuration: Configuration
 
   public private(set) var state: State = .idle
@@ -24,11 +29,14 @@ public actor BrowserDropServer {
 
   let logger = Logger(subsystem: "com.tortugapower.BrowserDrop", category: "server")
   private let eventSink: AsyncStream<Event>.Continuation
+  private let progressSink: AsyncStream<[UploadProgress]>.Continuation
 
   var staging: Staging?
-  /// Uploads in progress, for the free-space check: what each still has to write.
-  var inFlight: [Int: (size: Int64, received: Int64)] = [:]
+  /// Uploads in progress, for ``progress`` and the free-space check.
+  var inFlight: [Int: UploadProgress] = [:]
   var nextUploadID = 0
+  /// Connections being served, for ``Configuration/maximumConnections``.
+  var activeConnections = 0
 
   /// Runs `NetworkListener.run`. When it finishes, every connection has ended and the port is free.
   private var listenerTask: Task<Void, Never>?
@@ -38,7 +46,8 @@ public actor BrowserDropServer {
 
   public init(configuration: Configuration = Configuration()) {
     self.configuration = configuration
-    (events, eventSink) = AsyncStream.makeStream(of: Event.self, bufferingPolicy: .bufferingNewest(1_000))
+    (events, eventSink) = AsyncStream.makeStream(of: Event.self, bufferingPolicy: .unbounded)
+    (progress, progressSink) = AsyncStream.makeStream(of: [UploadProgress].self, bufferingPolicy: .bufferingNewest(1))
   }
 
   deinit {
@@ -46,6 +55,7 @@ public actor BrowserDropServer {
     pathTask?.cancel()
     staging?.remove()
     eventSink.finish()
+    progressSink.finish()
   }
 
   // MARK: - Session
@@ -118,46 +128,37 @@ public actor BrowserDropServer {
     return becameRunning(on: port)
   }
 
-  /// Ends the session and moves every complete upload into `destination`, keeping folder structure.
-  /// In-flight uploads are dropped. Names already taken in `destination` get ` (1)`, ` (2)`…
+  /// Ends the session and hands over what arrived: the folder holding every complete upload, laid out as the
+  /// browser sent it (`Book/Disc 1/01.mp3`). In-flight uploads are dropped. Returns `nil` when nothing
+  /// arrived.
   ///
-  /// Returns the moved top-level files and folders. Staging is wiped either way.
-  @discardableResult
-  public func finish(movingInto destination: URL) async throws -> [URL] {
+  /// The folder is yours from then on: move it, import from it, delete it. The server never touches it
+  /// again. It's inside ``Configuration/stagingRoot``, so ``removeLeftovers(in:)`` deletes it if you don't.
+  public func finish() async throws -> URL? {
     guard state != .closed else { throw BrowserDropError.sessionClosed }
     await close()
-    guard let staging else { return [] }
-    defer {
-      staging.remove()
-      self.staging = nil
-      receivedFiles = []
-    }
+    guard let staging else { return nil }
+    self.staging = nil
+    receivedFiles = []
 
-    var moved: [URL] = []
-    var failed: [String] = []
-    for item in staging.topLevelItems() {
-      let isDirectory = (try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-      let target = Staging.uniqueDestination(for: item.lastPathComponent, isDirectory: isDirectory, in: destination)
-      do {
-        try FileManager.default.moveItem(at: item, to: target)
-        moved.append(target)
-      } catch {
-        logger.error("Couldn't move \(item.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
-        failed.append(item.lastPathComponent)
-      }
+    staging.removeIncoming()
+    // Only a folder known to be empty is deleted: if it can't be listed, it's handed over all the same.
+    guard !staging.isEmpty else {
+      staging.remove()
+      return nil
     }
-    if !failed.isEmpty { throw BrowserDropError.couldNotMove(moved: moved, failed: failed) }
-    return moved
+    return staging.files
   }
 
-  /// Deletes a received file, or a folder and every file in it, so ``finish(movingInto:)`` won't hand it
-  /// over. `relativePath` is a ``ReceivedFile/relativePath`` or one of its folders, for example `Book`.
-  /// An upload still arriving at that path is added when it finishes.
+  /// Deletes a received file, or a folder and every file in it, so ``finish()`` won't hand it over.
+  /// `relativePath` is a ``ReceivedFile/relativePath`` or one of its folders, for example `Book`. An upload
+  /// still arriving at that path is added when it finishes.
   public func removeReceivedItem(at relativePath: String) throws {
     guard let staging, let segments = PathRules.segments(relativePath) else { return }
     let path = segments.joined(separator: "/")
     try staging.removeItem(at: path)
-    receivedFiles.removeAll { $0.relativePath == path || $0.relativePath.hasPrefix(path + "/") }
+    // Check the disk rather than the names: on a case-insensitive volume `book` removes `Book/01.mp3`.
+    receivedFiles.removeAll { !staging.containsFile(at: $0.relativePath) }
   }
 
   /// Ends the session and deletes everything that was uploaded.
@@ -179,6 +180,7 @@ public actor BrowserDropServer {
     await listenerTask?.value
     listenerTask = nil
     eventSink.finish()
+    progressSink.finish()
   }
 
   private func becameRunning(on port: UInt16) -> [Address] {
@@ -191,6 +193,11 @@ public actor BrowserDropServer {
 
   func emit(_ event: Event) {
     eventSink.yield(event)
+  }
+
+  /// Sends the uploads in flight to ``progress``, oldest first.
+  func publishProgress() {
+    progressSink.yield(inFlight.values.sorted { $0.upload.id < $1.upload.id })
   }
 
   // MARK: - Listener

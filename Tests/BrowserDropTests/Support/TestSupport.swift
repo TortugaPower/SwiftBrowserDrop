@@ -85,6 +85,37 @@ final class EventRecorder: Sendable {
   func contains(_ event: BrowserDropServer.Event) -> Bool { events.contains(event) }
 }
 
+/// Collects the lists a server's `progress` stream sends.
+final class ProgressRecorder: Sendable {
+  private let storage = OSAllocatedUnfairLock<[[BrowserDropServer.UploadProgress]]>(initialState: [])
+  private let task: Task<Void, Never>
+
+  init(_ server: BrowserDropServer) {
+    let stream = server.progress
+    let storage = storage
+    task = Task {
+      for await snapshot in stream {
+        storage.withLock { $0.append(snapshot) }
+      }
+    }
+  }
+
+  deinit { task.cancel() }
+
+  var snapshots: [[BrowserDropServer.UploadProgress]] { storage.withLock { $0 } }
+}
+
+/// Whether the temporary directory's volume treats `a` and `A` as one name, as a Mac's usually does.
+let temporaryVolumeIsCaseInsensitive: Bool = {
+  let values = try? FileManager.default.temporaryDirectory.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey])
+  return values?.volumeSupportsCaseSensitiveNames == false
+}()
+
+/// The names in a folder, sorted.
+func names(in folder: URL) throws -> [String] {
+  try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted()
+}
+
 /// A bare TCP client for what URLSession won't send: a foreign `Host` or `Origin`, a missing length,
 /// a body cut short, `Expect: 100-continue`.
 final class RawClient: @unchecked Sendable {
@@ -95,20 +126,34 @@ final class RawClient: @unchecked Sendable {
     connection = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
   }
 
-  func open() async throws {
+  /// Connects, giving up after `timeout`. `.waiting` isn't a failure, as for a browser: a busy loopback can
+  /// refuse an attempt with "address in use", and the connection is restarted until one goes through.
+  func open(timeout: Duration = .seconds(3)) async throws {
+    let queue = queue
+    let connection = connection
     let resumed = OSAllocatedUnfairLock(initialState: false)
+    let lastError = OSAllocatedUnfairLock<(any Error)?>(initialState: nil)
     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-      connection.stateUpdateHandler = { state in
-        let result: Result<Void, any Error>?
-        switch state {
-        case .ready: result = .success(())
-        case .failed(let error), .waiting(let error): result = .failure(error)
-        default: result = nil
-        }
-        guard let result, !resumed.withLock({ defer { $0 = true }; return $0 }) else { return }
+      let finish: @Sendable (Result<Void, any Error>) -> Void = { result in
+        guard !resumed.withLock({ defer { $0 = true }; return $0 }) else { return }
         continuation.resume(with: result)
       }
+      connection.stateUpdateHandler = { [weak connection] state in
+        switch state {
+        case .ready: finish(.success(()))
+        case .failed(let error): finish(.failure(error))
+        case .waiting(let error):
+          lastError.withLock { $0 = error }
+          // Left alone, a waiting connection only retries when the network changes, which loopback doesn't.
+          guard let connection else { break }
+          queue.asyncAfter(deadline: .now() + .milliseconds(50)) { connection.restart() }
+        default: break
+        }
+      }
       connection.start(queue: queue)
+      queue.asyncAfter(deadline: .now() + timeout.timeInterval) {
+        finish(.failure(lastError.withLock { $0 } ?? TestFailure("connect timed out")))
+      }
     }
   }
 

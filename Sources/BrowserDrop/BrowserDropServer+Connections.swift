@@ -6,13 +6,16 @@ extension BrowserDropServer {
   /// instead of a reset.
   static let drainLimit: Int64 = 8 << 20
   static let receiveChunk = 256 * 1024
+  static let pathConflict = HTTPResponse.error(
+    409, "path_conflict", "Another file or folder sent in this session already has this name."
+  )
 
   /// What one read from the browser gave.
   enum Chunk: Sendable {
     case data(Data)
     /// The browser closed the connection.
     case closed
-    /// The session stopped: ``suspend()``, ``finish(movingInto:)`` or ``cancel()``.
+    /// The session stopped: ``suspend()``, ``finish()`` or ``cancel()``.
     case cancelled
     /// Nothing arrived for ``Configuration/idleTimeout``.
     case timedOut
@@ -22,6 +25,12 @@ extension BrowserDropServer {
 
   /// Serves one request, then returns, which closes the connection.
   func serve(_ connection: NetworkConnection<TCP>) async {
+    guard activeConnections < configuration.maximumConnections else { return }
+    activeConnections += 1
+    defer { activeConnections -= 1 }
+
+    // The whole head has to arrive within the idle timeout, not just each piece of it.
+    let headDeadline = ContinuousClock.now + configuration.idleTimeout
     var buffer = Data()
     while true {
       if let end = buffer.range(of: Data("\r\n\r\n".utf8)) {
@@ -42,7 +51,7 @@ extension BrowserDropServer {
         await send(.error(431, "headers_too_large", "Request headers are too large."), on: connection)
         return
       }
-      guard case .data(let data) = await receive(from: connection) else { return }
+      guard case .data(let data) = await receive(from: connection, until: headDeadline) else { return }
       buffer.append(data)
     }
   }
@@ -94,6 +103,11 @@ extension BrowserDropServer {
       return
     }
 
+    if let staging, staging.conflicts(at: relativePath) {
+      emit(.uploadFailed(relativePath: relativePath, reason: .pathConflict))
+      await refuse(Self.pathConflict, unread: unread, on: connection)
+      return
+    }
     guard size <= configuration.maximumFileSize else {
       emit(.uploadFailed(relativePath: relativePath, reason: .tooLarge))
       await refuse(.error(413, "too_large", "The file is larger than this device accepts."), unread: unread, on: connection)
@@ -112,9 +126,13 @@ extension BrowserDropServer {
 
     nextUploadID += 1
     let upload = Upload(id: nextUploadID, relativePath: relativePath, size: size)
-    inFlight[upload.id] = (size, 0)
-    defer { inFlight[upload.id] = nil }
+    inFlight[upload.id] = UploadProgress(upload: upload, receivedBytes: 0)
+    // Normally it leaves the list before its final event (below); this covers every other way out.
+    defer {
+      if inFlight.removeValue(forKey: upload.id) != nil { publishProgress() }
+    }
     emit(.uploadStarted(upload))
+    publishProgress()
 
     if head.expectsContinue, body.isEmpty, size > 0 {
       try? await connection.send(HTTPResponse.continueInterim)
@@ -145,21 +163,28 @@ extension BrowserDropServer {
         break
       }
       received += Int64(chunk.count)
-      inFlight[upload.id] = (size, received)
+      inFlight[upload.id] = UploadProgress(upload: upload, receivedBytes: received)
       if received < size, received - reported >= progressStep {
         reported = received
-        emit(.uploadProgress(upload, receivedBytes: received))
+        publishProgress()
       }
     }
     try? handle.close()
 
     if failure == nil {
+      // Checked again here, where it can't race: another upload may have taken the name meanwhile.
       do {
         try staging.commit(incomingFile, to: relativePath)
+      } catch is Staging.PathConflict {
+        failure = .pathConflict
       } catch {
         failure = .writeFailed
       }
     }
+    // Out of the in-flight list before the final event, so no list shows it once it's finished or failed.
+    inFlight[upload.id] = nil
+    publishProgress()
+
     if let failure {
       try? FileManager.default.removeItem(at: incomingFile)
       emit(.uploadFailed(relativePath: relativePath, reason: failure))
@@ -168,6 +193,8 @@ extension BrowserDropServer {
         await send(.error(507, "insufficient_storage", "There isn't enough free space on this device."), on: connection)
       case .writeFailed:
         await send(.error(500, "write_failed", "The file couldn't be written."), on: connection)
+      case .pathConflict:
+        await send(Self.pathConflict, on: connection)
       default:
         break  // The connection is gone or the session stopped: nobody to answer.
       }
@@ -180,7 +207,6 @@ extension BrowserDropServer {
     } else {
       receivedFiles.append(file)
     }
-    emit(.uploadProgress(upload, receivedBytes: size))
     emit(.uploadFinished(file))
     await send(.json(201, ["path": relativePath]), on: connection)
   }
@@ -188,8 +214,10 @@ extension BrowserDropServer {
   /// Whether `size` more bytes leave ``Configuration/reservedFreeSpace`` free, counting what the uploads
   /// already in flight still have to write.
   private func hasRoom(for size: Int64, in staging: Staging) -> Bool {
-    guard let available = configuration.availableCapacity(staging.root) else { return true }
-    let pending = inFlight.values.reduce(Int64(0)) { $0 + $1.size - $1.received }
+    // A fresh URL each time: URLs cache resource values, so a reused one would keep answering with the
+    // free space of the first check, in the default reader and in an app's own alike.
+    guard let available = configuration.availableCapacity(URL(fileURLWithPath: staging.files.path)) else { return true }
+    let pending = inFlight.values.reduce(Int64(0)) { $0 + $1.upload.size - $1.receivedBytes }
     return available - pending - size >= configuration.reservedFreeSpace
   }
 
@@ -204,8 +232,9 @@ extension BrowserDropServer {
   ///
   /// `receive` returns empty data both when the browser closes the connection and when the session cancels
   /// this task; `Task.isCancelled` tells them apart.
-  nonisolated func receive(from connection: NetworkConnection<TCP>) async -> Chunk {
-    let timeout = configuration.idleTimeout
+  /// `deadline` cuts the wait short of ``Configuration/idleTimeout``.
+  nonisolated func receive(from connection: NetworkConnection<TCP>, until deadline: ContinuousClock.Instant? = nil) async -> Chunk {
+    let timeout = deadline.map { min(configuration.idleTimeout, max(.zero, $0 - ContinuousClock.now)) } ?? configuration.idleTimeout
     return await withTaskGroup(of: Chunk.self) { group in
       group.addTask {
         let content = (try? await connection.receive(atLeast: 1, atMost: Self.receiveChunk).content) ?? Data()
@@ -236,8 +265,9 @@ extension BrowserDropServer {
   private func refuse(_ response: HTTPResponse, unread: Int64, on connection: NetworkConnection<TCP>) async {
     await send(response, on: connection)
     guard unread > 0, unread <= Self.drainLimit else { return }
+    let deadline = ContinuousClock.now + configuration.idleTimeout
     var left = unread
-    while left > 0, case .data(let data) = await receive(from: connection) {
+    while left > 0, case .data(let data) = await receive(from: connection, until: deadline) {
       left -= Int64(data.count)
     }
   }

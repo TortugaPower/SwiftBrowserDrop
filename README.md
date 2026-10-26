@@ -22,7 +22,7 @@ Requirements: iOS 26 or macOS 26, Swift 6.2.
 ## Installation
 
 ```swift
-.package(url: "https://github.com/TortugaPower/SwiftBrowserDrop.git", from: "1.0.0")
+.package(url: "https://github.com/TortugaPower/SwiftBrowserDrop.git", from: "2.0.0")
 ```
 
 Then add the `BrowserDrop` product to your target.
@@ -54,15 +54,36 @@ Task {
   }
 }
 
-// The person is done: move everything that arrived, keeping folders.
-let moved = try await server.finish(movingInto: documentsFolder)
+// The person is done: take the folder holding everything that arrived, laid out as they sent it.
+if let folder = try await server.finish() {
+  // It's yours now: move it where your app keeps things, or import from it and delete it.
+  try FileManager.default.moveItem(at: folder, to: inbox)
+}
 
 // Or they cancelled: delete it all.
 await server.cancel()
 ```
 
-`receivedFiles` always lists what's complete. Uploading the same relative path again replaces that file,
-so retries never create duplicates. Names already taken in the destination get ` (1)`, ` (2)`…
+`receivedFiles` always lists what's complete. Uploading exactly the same relative path again replaces that
+file, so retries never create duplicates. Anything else that would take a name already used in the session
+is refused (see [Security model](#security-model)).
+
+`finish()` returns `nil` when nothing arrived. Otherwise the folder it returns belongs to your app: the
+server never touches it again, and naming, moving and handling errors are up to you. It sits inside
+`stagingRoot`, so `removeLeftovers()` at the next launch deletes it if your app didn't.
+
+`events` brings a couple of events per upload (started, then finished or failed) and network changes.
+Nothing is dropped, so read it for the whole session. For a progress bar, read `progress` too: each element
+lists the uploads in flight and how much of each has arrived, and only the newest list is kept, so a reader
+that falls behind skips straight to the current one.
+
+```swift
+Task {
+  for await uploads in server.progress {
+    for item in uploads { print(item.upload.relativePath, item.receivedBytes, "of", item.upload.size) }
+  }
+}
+```
 
 To drop something the person changed their mind about, call `removeReceivedItem(at:)` with a file's
 relative path, or with a folder (`Book`) to drop it and everything in it. It won't be handed over.
@@ -74,7 +95,8 @@ relative path, or with a folder (`Book`) to drop it and everything in it. It won
 - **Suspend in the background and resume in the foreground.** iOS suspends apps in the background, so the
   server can't keep listening there. `suspend()` keeps the files that already arrived; `resume()` listens
   again on the same port, so an open browser tab carries on and the bundled page retries what was cut off.
-- **Clean up at launch.** If the app was killed mid-session, its staging is still in `tmp`. Call
+- **Clean up at launch.** If the app was killed mid-session, its staging is still in `tmp`, and so is a
+  folder `finish()` handed over that the app never moved or deleted. Call
   `BrowserDropServer.removeLeftovers()` at launch, before creating a server.
 - **No local network permission is needed.** Accepting incoming TCP connections isn't a local network
   operation ([TN3179](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy)),
@@ -96,7 +118,15 @@ the person to accept it in your app. So it has **no password or pairing code by 
   control characters are refused, and so are file types not in `allowedExtensions`.
 - **Size and space.** Files over `maximumFileSize` get 413. An upload that would leave less than
   `reservedFreeSpace` on the device gets 507, counting what in-flight uploads still have to write.
-- **Quiet connections** are closed after `idleTimeout`.
+- **Quiet connections.** A connection that sends nothing for `idleTimeout`, or takes longer than that to
+  send its request head, is closed. Slow uploads are left alone, however slow: on bad Wi‑Fi they still finish.
+- **Connections** are capped at `maximumConnections` (64 by default); more are closed right away, so other
+  devices can't exhaust the app's file descriptors.
+- **Names.** Only exactly the same path replaces an earlier upload, which is what a retry sends. An upload
+  that would take a name the session already uses in another form gets 409 and changes nothing: a folder
+  where the file goes, a file where one of its folders goes (`x/y.mp3` after `x`), or the same name in
+  another case on a case-insensitive volume (`A.mp3` after `a.mp3` on a Mac). It's checked before the body
+  is read, and again when the file is stored, in case another upload took the name meanwhile.
 - **Nothing else.** Only `GET` (the page and `config.json`) and `POST /upload` exist. No directory listings,
   and page files can't be served from outside the page folder, symlinks included.
 
@@ -144,6 +174,7 @@ A successful upload answers `201` with `{"path": "<cleaned path>"}`. Errors answ
 | 403 | `forbidden` | Not from the server's own page. |
 | 404 | `not_found` | No such page file. |
 | 405 | `method_not_allowed` | Anything but the requests above. |
+| 409 | `path_conflict` | Another file or folder in the session already has that name. |
 | 411 | `length_required` | No `Content-Length`, or a chunked body. |
 | 413 | `too_large` | Over `maximumFileSize`. |
 | 431 | `headers_too_large` | The request head is over 16 KiB. |
@@ -177,6 +208,7 @@ replaced through `strings`; `{done}`, `{total}` and `{count}` are filled in by t
 | `notEnoughSpace` | Not enough space on the device |
 | `tooLarge` | Too large |
 | `unsupported` | File type not supported |
+| `pathConflict` | Another file or folder you sent has this name |
 | `skipped` | Skipped because the type isn't supported: {count} |
 | `retry` | Retry failed |
 | `doneHint` | When you're done, confirm on your device to import the files. |
@@ -185,6 +217,20 @@ replaced through `strings`; `{done}`, `{total}` and `{count}` are filled in by t
 To replace the page entirely, use `.custom(directory:contentSecurityPolicy:)`. The server serves `index.html`
 for `/` and any other file in that folder by its relative path. Your page reads `/config.json` and uploads
 with `POST /upload` as described above.
+
+## Migrating from 1.x
+
+- **`finish(movingInto:)` is now `finish()`,** which returns the folder holding what arrived (or `nil`)
+  instead of moving it. Moving, naming and what to do when a move fails are your app's to decide, so
+  `BrowserDropError.couldNotMove` is gone. To keep 1.x's behavior, move the folder's items where you want
+  them.
+- **Progress left `events`:** `.uploadProgress` is replaced by the `progress` stream. `events` no longer
+  drops anything, however far behind its reader is.
+- **Name conflicts are refused** with 409 and `FailureReason.pathConflict`, where 1.x replaced a folder
+  with a file (keeping it in `receivedFiles`) or failed with 500. The bundled page shows the new
+  `pathConflict` string. The protocol stays at version 1: a page that doesn't know `path_conflict` shows
+  it as a failure.
+- **New:** `Configuration.maximumConnections` (64), and the request head must arrive within `idleTimeout`.
 
 ## Development
 

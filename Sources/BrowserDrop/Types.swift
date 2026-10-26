@@ -11,7 +11,7 @@ extension BrowserDropServer {
     case running(port: UInt16)
     /// Not listening, session kept. ``BrowserDropServer/resume()`` listens again on the same port.
     case suspended
-    /// Finished or cancelled. Staging is gone.
+    /// Finished or cancelled. The server holds nothing any more.
     case closed
   }
 
@@ -24,7 +24,7 @@ extension BrowserDropServer {
     public let size: Int64
   }
 
-  /// A finished upload waiting in staging until ``BrowserDropServer/finish(movingInto:)``.
+  /// A finished upload waiting in staging until ``BrowserDropServer/finish()``.
   public struct ReceivedFile: Sendable, Hashable, Identifiable {
     public let relativePath: String
     public let size: Int64
@@ -37,16 +37,22 @@ extension BrowserDropServer {
     }
   }
 
+  /// How much of an upload has arrived. ``BrowserDropServer/progress`` lists one per upload in flight, sent
+  /// whenever one of them starts, ends or advances about 1% of its size (at least 512 KiB); each shows what
+  /// had arrived by then.
+  public struct UploadProgress: Sendable, Hashable {
+    public let upload: Upload
+    public let receivedBytes: Int64
+  }
+
   public enum Event: Sendable, Equatable {
-    /// The request was accepted and the body is arriving.
+    /// The request was accepted and the body is arriving. ``BrowserDropServer/progress`` follows it.
     case uploadStarted(Upload)
-    /// More of the body was written. Reported about every 1% (at least every 512 KiB).
-    case uploadProgress(Upload, receivedBytes: Int64)
-    /// The file is complete and in ``BrowserDropServer/receivedFiles``. An earlier file at the same
-    /// path was replaced.
+    /// The file is complete and in ``BrowserDropServer/receivedFiles``. An earlier upload of exactly the
+    /// same path was replaced.
     case uploadFinished(ReceivedFile)
     /// The upload ended without a file. It can come without `uploadStarted` when the file was refused
-    /// up front, for its size or for lack of space.
+    /// up front: for a name that's taken, its size, or lack of space.
     case uploadFailed(relativePath: String, reason: FailureReason)
     /// The device's addresses changed while running, for example after joining another Wi‑Fi network.
     case addressesChanged([Address])
@@ -58,8 +64,8 @@ extension BrowserDropServer {
   public enum FailureReason: Sendable, Equatable {
     /// The browser went away before sending the whole file.
     case disconnected
-    /// The server stopped it: ``BrowserDropServer/suspend()``, ``BrowserDropServer/finish(movingInto:)``
-    /// or ``BrowserDropServer/cancel()``.
+    /// The server stopped it: ``BrowserDropServer/suspend()``, ``BrowserDropServer/finish()`` or
+    /// ``BrowserDropServer/cancel()``.
     case cancelled
     /// Nothing arrived for ``Configuration/idleTimeout``.
     case timedOut
@@ -69,6 +75,10 @@ extension BrowserDropServer {
     case insufficientStorage
     /// The file couldn't be written to staging.
     case writeFailed
+    /// Something else this session received already has that name: a folder where the file goes, a file
+    /// where one of its folders goes, or the same name in another case on a case-insensitive volume. Only
+    /// an earlier upload of exactly the same path is replaced.
+    case pathConflict
   }
 
   /// An address the page can be opened at from a computer on the same network.
@@ -106,7 +116,4 @@ public enum BrowserDropError: Error, Sendable, Equatable {
   case couldNotListen(ports: [UInt16])
   /// The staging folder couldn't be created.
   case stagingUnavailable
-  /// ``BrowserDropServer/finish(movingInto:)`` moved `moved` but couldn't move the items named in `failed`.
-  /// Staging was wiped either way.
-  case couldNotMove(moved: [URL], failed: [String])
 }
